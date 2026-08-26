@@ -370,18 +370,59 @@ def _print_status(base_dir):
     print("=" * 60)
 
 
+# ── Single-instance lock ─────────────────────────────────────────────────────
+def _pid_alive(pid):
+    """Return True if a process with this PID is running."""
+    try:
+        if os.name == "nt":
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return str(pid) in r.stdout
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _acquire_lock(lock_path):
+    """Single-instance lock via PID file. Returns True if this process owns it."""
+    lock_path = Path(lock_path)
+    try:
+        if lock_path.exists():
+            pid = int(lock_path.read_text().strip())
+            if _pid_alive(pid):
+                return False
+        lock_path.write_text(str(os.getpid()))
+        return True
+    except Exception:
+        return True  # if lock handling fails, let the download proceed
+
+
+def _running_downloader_lines(script_path):
+    """Return command lines of running downloader instances (not the watchdog)."""
+    if os.name == "nt":
+        # tasklist only shows the image name (python.exe), never the script,
+        # so use wmic to read the full command line.
+        r = subprocess.run(
+            ["wmic", "process", "where", "name='python.exe'", "get", "ProcessId,CommandLine"],
+            capture_output=True, text=True, timeout=10,
+        )
+    else:
+        r = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True, timeout=10)
+    script = os.path.basename(script_path)
+    return [
+        line for line in (r.stdout or "").splitlines()
+        if script in line and "--watchdog-only" not in line
+    ]
+
+
 # ── Watchdog ──────────────────────────────────────────────────────────────────
 def _run_watchdog(script_path, log_path, interval):
     """Monitor the downloader and restart it if it stops."""
     def count_instances():
-        if os.name == "nt":
-            r = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=10,
-            )
-        else:
-            r = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True, timeout=10)
-        return (r.stdout or "").count(os.path.basename(script_path))
+        return len(_running_downloader_lines(script_path))
 
     def start():
         with open(log_path, "a", encoding="utf-8") as log:
@@ -412,11 +453,16 @@ def _download_loop(args):
     base_dir = os.path.abspath(args.output)
     os.makedirs(base_dir, exist_ok=True)
     state_file = os.path.join(base_dir, "_state.json")
+    lock_file = os.path.join(base_dir, "_downloader.lock")
     max_file_bytes = (args.max_size or 0) * 1024 * 1024 if args.max_size else 0
 
     if args.status:
         _print_status(base_dir)
         return
+
+    if not _acquire_lock(lock_file):
+        print("Another downloader instance is already running. Exiting.")
+        sys.exit(0)
 
     state = _load_state(state_file)
     sess = _create_session()

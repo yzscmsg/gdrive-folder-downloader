@@ -77,6 +77,13 @@ A Python tool to download an entire public/shared Google Drive folder (`1Rf0-NFX
 
 **Solution:** `retry_failed.py` script re-attempts all files in the `failed_files` list. Also, the main downloader naturally retries failed files on resume (they're not marked as completed).
 
+### 11. Duplicate processes corrupting state
+**Problem:** 13 downloader instances ran at once (watchdog couldn't detect running ones on Windows because `tasklist` only shows `python.exe`, never the script name) — they thrashed the same `_state.json`, corrupting it and re-downloading files.
+
+**Solution:**
+- Watchdog now uses `wmic` to read real command lines and counts only downloader instances (excluding itself via `--watchdog-only`).
+- Added a single-instance PID lock (`_downloader.lock`) — a second downloader refuses to start if one is alive.
+
 ## How to use the reusable skill
 
 ```bash
