@@ -9,6 +9,7 @@ A Python tool to download an entire public/shared Google Drive folder (`1Rf0-NFX
 |------|---------|
 | `gdrive_folder_downloader.py` | **Reusable skill** — self-contained CLI tool for any Google Drive shared folder |
 | `gd_download_v2.py` | The working downloader used for this specific folder |
+| `parallel_launcher.py` | Parallel launcher — discovers top-level folders and spawns workers |
 | `gd_watchdog.py` | Watchdog that auto-restarts the downloader every 20 minutes |
 | `retry_failed.py` | One-shot script to retry previously failed files |
 | `gdrive_download/` | Download output directory |
@@ -77,7 +78,12 @@ A Python tool to download an entire public/shared Google Drive folder (`1Rf0-NFX
 
 **Solution:** `retry_failed.py` script re-attempts all files in the `failed_files` list. Also, the main downloader naturally retries failed files on resume (they're not marked as completed).
 
-### 11. Duplicate processes corrupting state
+### 11. Parallel downloading
+**Problem:** Single-process download is too slow for 120K+ files (bottlenecked by sequential folder enumeration).
+
+**Solution:** `parallel_launcher.py` discovers top-level subfolders and spawns parallel workers. Each worker gets `--root-folder-id <id>` and its own output directory and state file. Achieved **~20x speedup** (13 → 260 files/min).
+
+### 12. Duplicate processes corrupting state
 **Problem:** 13 downloader instances ran at once (watchdog couldn't detect running ones on Windows because `tasklist` only shows `python.exe`, never the script name) — they thrashed the same `_state.json`, corrupting it and re-downloading files.
 
 **Solution:**
@@ -103,21 +109,48 @@ python gdrive_folder_downloader.py --folder-id <FOLDER_ID> --output ./downloads 
 python gdrive_folder_downloader.py --folder-id <FOLDER_ID> --output ./downloads --retry-failed
 ```
 
+## Parallel downloading
+
+For large folders, use `parallel_launcher.py` to download in parallel:
+
+```bash
+# Auto-discover top-level folders and spawn one worker per folder
+python parallel_launcher.py
+
+# Each worker gets its own output dir: gdrive_download/parallel/<worker>/
+# Each worker has its own state file for independent resume
+# Logs: gdrive_download/parallel/<worker>/_worker.log
+```
+
+The launcher:
+1. Lists top-level subfolders of the root Drive folder
+2. Groups them into balanced batches (up to 8 workers)
+3. Spawns one `gd_download_v2.py --root-folder-id <id>` per batch
+4. Monitors workers and reports status
+
+Speed improvement: **~20x faster** than single-process (tested: 13 files/min → 260 files/min with 3 workers).
+
 ## Architecture
 
 ```
 ┌─────────────────────┐
-│  gdrive_folder_     │  ← Single-file reusable CLI
-│  downloader.py      │
+│  parallel_launcher  │  ← Discovers folders, spawns workers
 └──────┬──────────────┘
        │
-       ├── walk_folder()     ← Recursive DFS through Drive
-       │   ├── list_folder() ← HTTP request to embeddedfolderview
-       │   └── download_file() ← Stream download with size check
-       │
-       ├── _state.json       ← Persistent resume checkpoint
-       │
-       └── Watchdog mode     ← Monitors + auto-restarts
+       ├── worker0 ──── gd_download_v2.py --root-folder-id <id>
+       ├── worker1 ──── gd_download_v2.py --root-folder-id <id>
+       └── worker2 ──── gd_download_v2.py --root-folder-id <id>
+              │
+              ├── walk_folder()     ← Recursive DFS through Drive
+              │   ├── list_folder() ← HTTP request to embeddedfolderview
+              │   └── download_file() ← Stream download with size check
+              │
+              └── _state.json       ← Per-worker resume checkpoint
+
+┌─────────────────────┐
+│  gdrive_folder_     │  ← Single-file reusable CLI
+│  downloader.py      │
+└─────────────────────┘
 ```
 
 ## Key design decisions
